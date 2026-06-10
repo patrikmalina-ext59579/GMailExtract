@@ -1,1 +1,1638 @@
+<#
+.SYNOPSIS
+    Exports O365 mailbox messages and attachments via EWS with conversation tracking.
+
+.DESCRIPTION
+    Processes individual messages, extracts content and attachments, and tracks
+    conversation threads to avoid duplicate attachment extraction.
+
+.PARAMETER MessageId
+    The unique identifier of the message to process.
+
+.PARAMETER MailboxName
+    The email address of the mailbox to access.
+
+.PARAMETER ExportBasePath
+    The root directory for exported data. Defaults to .\MailExport
+
+.PARAMETER EwsUrl
+    The EWS endpoint URL. Defaults to Office 365 EWS endpoint.
+
+.EXAMPLE
+    .\Export-EWSMessage.ps1 -MessageId "AAMkAGVm..." -MailboxName "user@domain.com"
+#>
+
+param(
+    #[Parameter(Mandatory=$true)]
+    #[string]$MessageId,
+    [Parameter(Mandatory=$true)]
+    [string]$InputFilePath,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$MailboxName,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ExportBasePath = ".\MailExport",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$EwsUrl = "https://outlook.office365.com/EWS/Exchange.asmx",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CSVFolderPath = ".\cases-csv",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CSVCaseIdColumn = "Číslo podání",
+
+    [string]$SharePointSiteUrl = "",
+    [string]$SharePointBasePath = "",
+    [string]$ClientId = '',
+    [string]$TenantId = '',
+    [string]$CertificateThumbprint = '',
+    [switch]$doNotStoreToFileSystem,
+    [switch]$doNotUploadToSPO,
+    [switch]$dryRun,
+    [switch]$testConn
+
+)
+
+# Global conversation cache to track processed conversations
+if (-not $global:ConversationCache) {
+    $global:ConversationCache = @{}
+}
+
+# Initialize logging
+$logPath = Join-Path $ExportBasePath "export_log.txt"
+function Write-Log {
+    
+    param(
+    [string]$Message, 
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("INFO", "WARNING", "ERROR", "DEBUG", "TEST")]
+    [string]$Level = "INFO"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    
+    switch ($level){
+        
+        "INFO" {Write-Host $logMessage; break}
+        "WARNING" {Write-Host $logMessage -ForegroundColor Yellow; break}
+        "ERROR" {Write-Host $logMessage -ForegroundColor Red; break}
+        "DEBUG" {Write-Host $logMessage -ForegroundColor cyan; break}
+        "TEST" {Write-Host $logMessage -ForegroundColor green  ; break}
+        default {Write-Host $logMessage -ForegroundColor magenta}
+    }
+    
+    
+    
+    
+    try {
+        Add-Content -Path $logPath -Value $logMessage -ErrorAction Stop
+    } catch {
+        Write-Warning "Failed to write to log: $_"
+    }
+}
+
+# Load EWS Managed API
+function Initialize-EWS {
+    try {
+        Write-Log "Loading EWS Managed API..."
+        
+        # Try to load from GAC or common paths
+        $ewsDll = "Microsoft.Exchange.WebServices.dll"
+        $ewsPaths = @(
+            "C:\Program Files\Microsoft\Exchange\Web Services\2.2\$ewsDll",
+            "C:\Program Files (x86)\Microsoft\Exchange\Web Services\2.2\$ewsDll",
+            "$PSScriptRoot\$ewsDll"
+        )
+        
+        $loaded = $false
+        foreach ($path in $ewsPaths) {
+            if (Test-Path $path) {
+                Import-Module $path -ErrorAction Stop
+                $loaded = $true
+                Write-Log "EWS API loaded from: $path"
+                break
+            }
+        }
+        
+        if (-not $loaded) {
+            throw "EWS Managed API DLL not found. Please install from: https://www.microsoft.com/en-us/download/details.aspx?id=42951"
+        }
+        
+        return $true
+    } catch {
+        Write-Log "Failed to load EWS API: $_" -Level "ERROR"
+        throw
+    }
+}
+
+# Create EWS Service connection
+function New-EWSService {
+    param([string]$Mailbox)
+    
+    try {
+        Write-Log "Creating EWS service connection for: $Mailbox"
+        
+        $service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1)
+        $service.Url = New-Object Uri($EwsUrl)
+        
+        # Use default credentials (Windows authentication)
+        $service.UseDefaultCredentials = $true
+        
+        # Alternatively, use specific credentials:
+        # $service.Credentials = New-Object System.Net.NetworkCredential("username", "password", "domain")
+        
+        # Set impersonation if needed
+        $service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $Mailbox)
+        
+        Write-Log "EWS service connection established"
+        return $service
+    } catch {
+        Write-Log "Failed to create EWS service: $_" -Level "ERROR"
+        throw
+    }
+}
+
+function Get-CertificateByThumbprint {
+    param(
+        [string]$Thumbprint
+    )
+
+    try {
+        Write-Log "Loading certificate from store with thumbprint: $Thumbprint"
+
+        # Search in CurrentUser\My store first
+        $cert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $Thumbprint } | Select-Object -First 1
+
+        if ($cert) {
+            Write-Log "Certificate found in CurrentUser\My store"
+            return $cert
+        }
+
+        # If not found, search in LocalMachine\My store
+        $cert = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $Thumbprint } | Select-Object -First 1
+
+        if ($cert) {
+            Write-Log "Certificate found in LocalMachine\My store"
+            return $cert
+        }
+
+        throw "Certificate with thumbprint '$Thumbprint' not found in CurrentUser\My or LocalMachine\My stores"
+    }
+    catch {
+        Write-Log "Error loading certificate: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+function New-EWSService2 {
+    param([string]$Mailbox)
+    
+    try {
+        
+        if ($null -eq $script:ExoAuthFact){
+
+            Write-Log "No Exch svc instance, creating..." -Level WARNING
+            
+            $script:ExoAuthFact =  New-AadAuthenticationFactory -DefaultScopes "https://outlook.office365.com/.default" -Name ExoAuthFact `
+                    -ClientId $ClientId `
+                    -TenantId $TenantId `
+                    -X509Certificate $Cert
+        } else {
+            
+            Write-Log "Exch svc instance exists, reusing..." -Level WARNING
+            
+        }
+ 
+        # load EWS api dll
+        Add-Type -Path Exchange.WebServices.Managed.Api.2.2.1.2/lib/net35/Microsoft.Exchange.WebServices.dll
+        #$script:headers = Get-AadToken
+        Write-Log "Creating new token header object..." -Level WARNING
+            
+        $script:headersEWS = Get-AadToken -Factory $script:ExoAuthFact -ForceRefresh
+        #$script:headersEWS | Format-List | Out-Host
+        Write-Log "Token expires on: $($script:headersEWS.expiresOn)" -Level WARNING
+        
+        # connect to the service
+        $service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1)
+        $service.Credentials = New-Object Microsoft.Exchange.WebServices.Data.OAuthCredentials($script:headersEWS.AccessToken)
+
+        $ewsUrl = "https://outlook.office365.com/EWS/Exchange.asmx"
+        $service.Url = New-Object Uri($ewsUrl)
+        #$Mailbox
+        $mailboxEmailAddress = $Mailbox
+        
+        $service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId(
+                                    [Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $mailboxEmailAddress)
+        
+        
+                
+        <#
+        Write-Log "Creating EWS service connection for: $Mailbox"
+        
+        $service = New-Object Microsoft.Exchange.WebServices.Data.ExchangeService([Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1)
+        $service.Url = New-Object Uri($EwsUrl)
+        
+        # Use default credentials (Windows authentication)
+        $service.UseDefaultCredentials = $true
+        
+        # Alternatively, use specific credentials:
+        # $service.Credentials = New-Object System.Net.NetworkCredential("username", "password", "domain")
+        
+        # Set impersonation if needed
+        $service.ImpersonatedUserId = New-Object Microsoft.Exchange.WebServices.Data.ImpersonatedUserId([Microsoft.Exchange.WebServices.Data.ConnectingIdType]::SmtpAddress, $Mailbox)
+        #>
+
+        Write-Log "EWS service connection established"
+        return $service
+    } catch {
+        Write-Log "Failed to create EWS service: $_" -Level "ERROR"
+        throw
+    }
+}
+
+
+# Get message by ID
+function Get-EWSMessage {
+    param(
+        [Microsoft.Exchange.WebServices.Data.ExchangeService]$ExchService,
+        [string]$MsgId
+    )
+    
+    try {
+        Write-Log "Retrieving message: $MsgId"
+        
+        $itemId = New-Object Microsoft.Exchange.WebServices.Data.ItemId($MsgId)
+        #[Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties,
+        
+        $propertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet(
+        [Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties,
+        [Microsoft.Exchange.WebServices.Data.ItemSchema]::DateTimeReceived)
+        
+        $propertySet.RequestedBodyType = [Microsoft.Exchange.WebServices.Data.BodyType]::HTML
+        
+        Write-Log "itemId: $itemId"
+        
+        #retry
+        $Attempt = 1
+        $conStat = $false
+        
+        do {
+            try {
+                $message = [Microsoft.Exchange.WebServices.Data.EmailMessage]::Bind($ExchService, $itemId, $propertySet)
+                #$message = [Microsoft.Exchange.WebServices.Data.EmailMessage]::Bind($ExchService, $itemId)
+                $conStat = $true
+        
+            }
+            catch {
+                
+                write-Log $_.ToString()   -Level WARNING
+                write-Log "Message not bound..."   -Level ERROR
+                
+
+                
+                if ($_.ToString() -match 'Unauthorized'){
+                    Start-Sleep -Seconds 30
+                    $script:exchservice = (New-EWSService2 -Mailbox $MailboxName)[-1]
+                }
+
+
+            }
+            $Attempt++
+            
+        } while ($Attempt -lt 5 -and $conStat -eq $false)
+
+        if ($conStat){
+            Write-Log "Message retrieved successfully: $($message.Subject)"
+            return $message    
+        } else {
+            Write-Log "Failed to retrieve message $MsgId : $_" -Level "ERROR"
+            throw
+
+        }
+        
+        
+    } catch {
+        Write-Log "Failed to retrieve message $MsgId : $_" -Level "ERROR"
+        throw
+    }
+}
+
+# Get all messages in a conversation
+function Get-ConversationMessages {
+    param(
+        [Microsoft.Exchange.WebServices.Data.ExchangeService]$Service,
+        [Microsoft.Exchange.WebServices.Data.EmailMessage]$Message
+    )
+    
+    try {
+        if (-not $Message.ConversationId) {
+            Write-Log "Message has no conversation ID, treating as standalone"
+            return @($Message)
+        }
+        
+        $conversationId = $Message.ConversationId.UniqueId
+        Write-Log "Retrieving conversation messages for: $conversationId"
+        
+        # Check cache
+        if ($global:ConversationCache.ContainsKey($conversationId)) {
+            Write-Log "Conversation already processed, using cached data"
+            return $global:ConversationCache[$conversationId].Messages
+        }
+        
+        <# Search for all messages in the conversation
+        $view = New-Object Microsoft.Exchange.WebServices.Data.ItemView(100)
+        $filter = New-Object Microsoft.Exchange.WebServices.Data.SearchFilter+IsEqualTo(
+            [Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::ConversationId,
+            $Message.ConversationId
+        )
+        
+        $findResults = $Service.FindItems([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::MsgFolderRoot, $filter, $view)
+        
+        #>
+
+        # Properties you want on each item
+        $ps = New-Object Microsoft.Exchange.WebServices.Data.PropertySet(
+            [Microsoft.Exchange.WebServices.Data.BasePropertySet]::IdOnly,
+            [Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::Subject,
+            [Microsoft.Exchange.WebServices.Data.EmailMessageSchema]::DateTimeReceived
+        )
+        
+        # Sort order (e.g., TreeOrderDescending)
+        $sortOrder = [Microsoft.Exchange.WebServices.Data.ConversationSortOrder]::TreeOrderDescending
+
+        <# Folders to ignore (optional)
+        $ignoreFolders = New-Object 'System.Collections.Generic.List[Microsoft.Exchange.WebServices.Data.FolderId]'
+        $ignoreFolders.Add([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::DeletedItems)
+        $ignoreFolders.Add([Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Drafts)
+        #>
+
+        #retry
+        $Attempt = 1
+        $conStat = $false
+        
+        do {
+            try {
+                # Retrieve conversation items
+                $response = $service.GetConversationItems(
+                    $conversationId,
+                    $ps,
+                    $null,          # SyncState (omit or reuse if you cache it)
+                    $null,           #$ignoreFolders,
+                    $sortOrder
+                )
+                $conStat = $true
+        
+            }
+            catch {
+                write-Log "Message not bound..."   -Level ERROR
+                if ($_.ToString() -match 'Unauthorized'){
+                    Start-Sleep -Seconds 30
+                    $script:exchservice = (New-EWSService2 -Mailbox $MailboxName)[-1]
+                }
+
+
+            }
+            $Attempt++
+            
+        } while ($Attempt -lt 5 -and $conStat -eq $false)
+        
+        
+        #Write-Log "Found conversation messages: $($findResults.Items.count)"
+        $messages = @()
+        
+        #$response | Format-List | Out-Host
+        
+        foreach ($node in @($response.ConversationNodes)) {
+            
+            #$node | Format-List | Out-Host
+            
+            #Write-Log "Parent Index: $($node.ParentConversationIndex)"
+            #Write-Log "Node Index:   $($node.ConversationIndex)"
+
+            #$node.Items | Format-List | Out-Host
+
+
+
+            foreach ($item in $node.Items) {
+                        
+                $propertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties)
+                $propertySet.RequestedBodyType = [Microsoft.Exchange.WebServices.Data.BodyType]::HTML
+                $item.Load($propertySet)
+                $messages += $item
+                
+                
+                #$msg = [Microsoft.Exchange.WebServices.Data.EmailMessage]$item
+                #Write-Log "  ID:      $($msg.Id.UniqueId)"
+                #Write-Log "  Subject: $($msg.Subject)"
+                #Write-Log "  Received: $($msg.DateTimeReceived)"
+            }
+        }
+        
+        
+        <#
+        #$messages = @()
+        foreach ($item in $findResults.Items) {
+            $propertySet = New-Object Microsoft.Exchange.WebServices.Data.PropertySet([Microsoft.Exchange.WebServices.Data.BasePropertySet]::FirstClassProperties)
+            $propertySet.RequestedBodyType = [Microsoft.Exchange.WebServices.Data.BodyType]::HTML
+            $item.Load($propertySet)
+            $messages += $item
+        }
+        #>
+        
+        Write-Log "Found $($messages.Count) messages in conversation"
+        
+        # Cache conversation info
+        $global:ConversationCache[$conversationId] = @{
+            Messages = $messages
+            ProcessedAttachments = @{}
+        }
+        
+        return $messages
+    } catch {
+        $_ | Out-Host
+        Write-Log "Failed to retrieve conversation messages: $_" -Level "ERROR"
+        return @($Message)
+    }
+}
+
+# Create output directory structure
+function New-OutputDirectory {
+    param(
+        [Microsoft.Exchange.WebServices.Data.EmailMessage]$Message,
+        [string]$BasePath,
+        [string]$Mailbox
+    )
+    
+    try {
+        # Create mailbox folder
+        $mailboxFolder = Join-Path $BasePath $Mailbox.Replace("@", "_at_")
+        
+        # Get parent folder path
+        $folderPath = "Inbox" # Default
+        try {
+            if ($Message.ParentFolderId) {
+                $folder = [Microsoft.Exchange.WebServices.Data.Folder]::Bind($Message.Service, $Message.ParentFolderId)
+                $folderPath = $folder.DisplayName
+            }
+        } catch {
+            Write-Log "Could not retrieve parent folder, using default" -Level "WARN"
+        }
+        
+        $subfolderPath = Join-Path $mailboxFolder $folderPath
+        
+        # Create message-specific folder
+        $dateStr = $Message.DateTimeReceived.ToString("yyyy-MM-dd_HHmmss")
+        $recipient = "Unknown"
+        if ($Message.ToRecipients.Count -gt 0) {
+            $recipient = $Message.ToRecipients[0].Address -replace '[<>:"/\\|?*]', '_'
+        }
+        
+        $messageFolderName = "${dateStr}_${recipient}"
+        $messagePath = Join-Path $subfolderPath $messageFolderName
+        
+        if (-not (Test-Path $messagePath)) {
+            if ($dryRun){
+                Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+            } else {
+                New-Item -Path $messagePath -ItemType Directory -Force | Out-Null
+                Write-Log "Created directory: $messagePath"
+            }
+        }
+        
+        return $messagePath
+    } catch {
+        Write-Log "Failed to create output directory: $_" -Level "ERROR"
+        throw
+    }
+}
+
+function New-OutputDirectory2 {
+    param(
+        [string]$BasePath,
+        [string]$Mailbox,
+        [object]$caseInfo,
+        [string]$mailboxFolder
+
+    )
+    
+    try {
+        
+        # Create folder structure: {Year}-{CaseId}/
+        $yearCaseFolder = "$($caseInfo.Year)-$($caseInfo.CaseId)"
+        #$caseFolderPath = "$basePath/$yearCaseFolder"
+        
+        # Create mailbox folder
+        $mailboxFolder = Join-Path $BasePath $Mailbox.Replace("@", "_at_")
+        
+        $subfolderPath = Join-Path $mailboxFolder $yearCaseFolder
+        
+        $messageFolderName = "mail"
+        $messagePath = Join-Path $subfolderPath $messageFolderName
+
+        Write-Log "Message path: $messagePath"
+        
+        if (-not (Test-Path $messagePath)) {
+            if ($dryRun){
+                Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+            } else {
+                New-Item -Path $messagePath -ItemType Directory -Force | Out-Null
+                Write-Log "Created directory: $messagePath"
+            }
+        }
+        
+        return $messagePath
+    } catch {
+        Write-Log "Failed to create output directory: $_" -Level "ERROR"
+        throw
+    }
+}
+
+# Export message body as HTML
+function Export-MessageBody {
+    param(
+        [Microsoft.Exchange.WebServices.Data.EmailMessage]$Message,
+        [string]$OutputPath
+    )
+    
+    try {
+        $htmlPath = Join-Path $OutputPath "message.html"
+        
+        $htmlContent = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>$($Message.Subject)</title>
+</head>
+<body>
+    <h2>$($Message.Subject)</h2>
+    <p><strong>From:</strong> $($Message.From.Address)</p>
+    <p><strong>To:</strong> $($Message.ToRecipients -join '; ')</p>
+    <p><strong>Date:</strong> $($Message.DateTimeReceived)</p>
+    <hr>
+    $($Message.Body.Text)
+</body>
+</html>
+"@
+        
+        [System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.Encoding]::UTF8)
+        Write-Log "Exported message body to: $htmlPath"
+        
+        return $htmlPath
+    } catch {
+        Write-Log "Failed to export message body: $_" -Level "ERROR"
+        throw
+    }
+}
+
+function Get-EmailContentAsHTML2 {
+    param(
+        [Microsoft.Exchange.WebServices.Data.EmailMessage]$Message
+        #[string]$OutputPath
+    )
+    
+    try {
+        #$htmlPath = Join-Path $OutputPath "message.html"
+        
+        $htmlContent = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>$($Message.Subject)</title>
+</head>
+<body>
+    <h2>$($Message.Subject)</h2>
+    <p><strong>From:</strong> $($Message.From.Address)</p>
+    <p><strong>To:</strong> $($Message.ToRecipients -join '; ')</p>
+    <p><strong>Date:</strong> $($Message.DateTimeReceived)</p>
+    <hr>
+    $($Message.Body.Text)
+</body>
+</html>
+"@
+        
+        #Write-Log $htmlContent
+        
+        #[System.IO.File]::WriteAllText($htmlPath, $htmlContent, [System.Text.Encoding]::UTF8)
+        #Write-Log "Exported message body to: $htmlPath"
+        
+        return ([System.Text.Encoding]::UTF8.GetBytes($htmlContent))
+            
+    } catch {
+        Write-Log "Failed to export message body: $_" -Level "ERROR"
+        throw
+    }
+}
+
+# Export attachment
+function Export-Attachment {
+    param(
+        [Microsoft.Exchange.WebServices.Data.Attachment]$Attachment,
+        [string]$OutputPath,
+        [string]$ConversationId
+    )
+    
+    try {
+        # Check if attachment already processed in this conversation
+        $attachmentKey = "$($Attachment.Name)_$($Attachment.Size)"
+        
+        if ($global:ConversationCache.ContainsKey($ConversationId) -and 
+            $global:ConversationCache[$ConversationId].ProcessedAttachments.ContainsKey($attachmentKey)) {
+            Write-Log "Attachment already exported in this conversation: $($Attachment.Name)"
+            return $null
+        }
+        
+        #retry
+        $Attempt = 1
+        $conStat = $false
+        
+        do {
+            try {
+                # Retrieve conversation items
+                # Load attachment content
+                $Attachment.Load()
+        
+                $conStat = $true
+        
+            }
+            catch {
+                write-Log "Message not bound..."   -Level ERROR
+                if ($_.ToString() -match 'Unauthorized'){
+                    Start-Sleep -Seconds 30
+                    $script:exchservice = (New-EWSService2 -Mailbox $MailboxName)[-1]
+                }
+
+
+            }
+            $Attempt++
+            
+        } while ($Attempt -lt 5 -and $conStat -eq $false)
+        
+        
+        
+        # Handle file attachments
+        if ($Attachment -is [Microsoft.Exchange.WebServices.Data.FileAttachment]) {
+            $fileName = $Attachment.Name -replace '[<>:"/\\|?*]', '_'
+            $filePath = Join-Path $OutputPath $fileName
+            
+            # Ensure unique filename
+            $counter = 1
+            while (Test-Path $filePath) {
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+                $extension = [System.IO.Path]::GetExtension($fileName)
+                $filePath = Join-Path $OutputPath "${baseName}_${counter}${extension}"
+                $counter++
+            }
+            
+            if ($dryRun){
+                Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+            } else {
+                [System.IO.File]::WriteAllBytes($filePath, $Attachment.Content)
+                Write-Log "Exported attachment: $filePath"
+            }
+            
+            # Mark as processed
+            if ($global:ConversationCache.ContainsKey($ConversationId)) {
+                $global:ConversationCache[$ConversationId].ProcessedAttachments[$attachmentKey] = $filePath
+            }
+            
+            return $filePath
+        }
+        
+        return $null
+    } catch {
+        Write-Log "Failed to export attachment $($Attachment.Name): $_" -Level "ERROR"
+        return $null
+    }
+}
+
+function Export-AttachmentToSPO {
+    param(
+        [Microsoft.Exchange.WebServices.Data.Attachment]$Attachment,
+        [string]$ConversationId
+    )
+    
+    try {
+
+        #$Attachment | Format-List | Out-Host
+        #"ConversationId: $ConversationId" | Out-Host
+        
+        # Check if attachment already processed in this conversation
+        $attachmentKey = "$($Attachment.Name)_$($Attachment.Size)"
+        
+        if ($global:ConversationCache.ContainsKey($ConversationId) -and 
+            $global:ConversationCache[$ConversationId].ProcessedAttachments.ContainsKey($attachmentKey)) {
+            Write-Log "Attachment already exported in this conversation: $($Attachment.Name)"
+            return $null
+        }
+        
+        # Load attachment content
+        $Attachment.Load()
+        
+        # Handle file attachments
+        if ($Attachment -is [Microsoft.Exchange.WebServices.Data.FileAttachment]) {
+        
+            $attachmentBytes = $attachment.Content
+            
+            $fileName = ($attachment.Name.Replace("�",""))
+            $fileName = $fileName -replace '[<>:"/\\|?*]', '_'
+            $fileName = $fileName.Replace("Ã­","A")
+            $fileName = $fileName.Replace("Ã","A")
+                $fileName = $fileName.Replace(":","-")
+            
+            $up = $null
+            $up = Upload-FileToSharePoint -Headers $headers -SiteId $siteId `
+                -DriveId $driveId -FolderPath "$caseFolderPath/Attachments" `
+                -FileName $fileName -FileContent $attachmentBytes
+            
+            if ($null -ne $up){
+                
+                if (-not $up){
+                    $actionStatus.numAttachmentsFound ++
+                    $actionStatus.attachmentsFoundNames += $fileName
+                } else {
+                    Write-Log "Exported attachment to SPO: $fileName"
+                }
+            }
+
+
+            <# Mark as processed
+            if ($global:ConversationCache.ContainsKey($ConversationId)) {
+                $global:ConversationCache[$ConversationId].ProcessedAttachments[$attachmentKey] = $fileName
+            }
+            #>
+            
+            return "$caseFolderPath/Attachments/$fileName"
+        }
+        
+        return $null
+    } catch {
+        Write-Log "Failed to export attachment $($Attachment.Name): $_" -Level "ERROR"
+        return $null
+    }
+}
+
+
+function Export-Metadata {
+    
+    param(
+        [string]$OutputPath,
+        [object]$csvMetadata
+    )
+    
+    try {
+        # Save metadata
+        $metadataJson = $csvMetadata | ConvertTo-Json -Depth 10
+        #$metadataBytes = [System.Text.Encoding]::UTF8.GetBytes($metadataJson)
+        $metadataFileName = "$($caseInfo.CaseId)-metadata.json"
+        $metadataPath = join-path $OutputPath $metadataFileName
+        
+        if ($dryRun){
+            Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+        } else {
+            [System.IO.File]::WriteAllText($metadataPath, $metadataJson, [System.Text.Encoding]::UTF8)
+        }
+        
+        Write-Log "Exported message body to: $metadataPath"
+        
+        return $htmlPath
+        }
+    catch {
+        Write-Log "Failed to export attachment $($Attachment.Name): $_" -Level "ERROR"
+        return $null
+    }
+
+
+}
+
+
+function Process-Message_t {
+    param(
+        [string]$MsgId,
+        [string]$Mailbox,
+        $exchService
+    )
+    
+    try {
+        Write-Log "========== Processing Message =========="
+        Write-Log "Message ID: $MsgId"
+        Write-Log "Mailbox: $Mailbox"
+        
+        # Initialize EWS
+        #Initialize-EWS | Out-Null
+        #$service = New-EWSService -Mailbox $Mailbox
+        #$service = (New-EWSService2 -Mailbox $Mailbox)[-1]
+                
+        # Get the message
+        Write-Log "Loading the e-mail message"
+        $message = Get-EWSMessage -MsgId $MsgId -exchservice $exchService
+
+        }
+    catch {
+        
+        $_
+    }
+}
+
+# Main processing function
+function Process-Message {
+    param(
+        [string]$MsgId,
+        [string]$Mailbox,
+        $exchService
+    )
+    
+    try {
+        Write-Log "========== Processing Message =========="
+        Write-Log "Message ID: $MsgId"
+        Write-Log "Mailbox: $Mailbox"
+        
+        # Initialize EWS
+        #Initialize-EWS | Out-Null
+        #$service = New-EWSService -Mailbox $Mailbox
+        #$service = (New-EWSService2 -Mailbox $Mailbox)[-1]
+                
+        # Get the message
+        Write-Log "Loading the e-mail message"
+        $message = Get-EWSMessage -MsgId $MsgId -exchservice $exchService
+
+        # Get conversation messages
+        #$conversationMessages = Get-ConversationMessages -Service $service -Message $message
+        #$conversationId = if ($message.ConversationId) { $message.ConversationId.UniqueId } else { "standalone" }
+        
+        
+        if (-not $doNotStoreToFileSystem){
+            ##file system output part
+            Write-Log "Starting the processing to file system store"
+            # Create output directory
+            Write-Log "Creating output directory"
+            $outputPath = New-OutputDirectory2 -BasePath $ExportBasePath -Mailbox $Mailbox -caseInfo $caseInfo -mailboxFolder $mailboxFolder
+
+            # Export message body
+            write-log "Exporting message body"
+            Export-MessageBody -Message $message -OutputPath $outputPath
+        
+            # Get conversation messages
+            $conversationMessages = Get-ConversationMessages -Service $exchservice -Message $message
+            $conversationId = if ($message.ConversationId) { $message.ConversationId.UniqueId } else { "standalone" }
+        
+            #Get attachment folder path
+
+            $mailParentPath = Split-Path $outputPath -Parent
+            $attachParentPath = Join-Path $mailParentPath "attachments"
+        
+            Write-Log "attachParentPath: $attachParentPath"
+
+            if (-not (Test-Path $attachParentPath)) {
+                if ($dryRun){
+                    Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+                } else {
+                    New-Item -Path $attachParentPath -ItemType Directory -Force | Out-Null
+                    Write-Log "Created directory: $attachParentPath"
+                }
+             }
+                        
+            # Process attachments from all messages in conversation
+            $attachmentCount = 0
+            foreach ($msg in $conversationMessages) {
+                if ($msg.HasAttachments) {
+                    Write-Log "Processing attachments from message: $($msg.Subject)"
+                
+                    foreach ($attachment in $msg.Attachments) {
+                        $result = Export-Attachment -Attachment $attachment -OutputPath $attachParentPath -ConversationId $conversationId
+                        if ($result) {
+                            $attachmentCount++
+                        }
+                    }
+                }
+            }
+
+            $actionStatus.allAttachmentsCount = $attachmentCount
+
+            #
+            $metaPath = Split-Path $outputPath -Parent
+            $metaExp = Export-Metadata -OutputPath $metaPath -csvMetadata $csvMetadata
+
+        }
+
+
+        if (-not $doNotUploadToSPO){
+            ##to SPO
+            Write-Log "Starting SPO upload part"
+            
+            # Create folder structure: {Year}-{CaseId}/
+            $yearCaseFolder = "$($caseInfo.Year)-$($caseInfo.CaseId)"
+            $basePath = $SharePointBasePath.TrimStart('/')
+            $caseFolderPath = "$basePath/$yearCaseFolder"
+
+            Write-Log "caseFolderPath: $caseFolderPath"
+
+            # Create year-caseId folder (or get if exists)
+            Write-Log "Creating/getting case folder: $yearCaseFolder"
+            $caseFolder = New-SharePointFolder -Headers $headers -SiteId $siteId `
+                -DriveId $driveId -ParentPath $basePath -FolderName $yearCaseFolder
+
+            $actionStatus.SPOCaseFldFound = -not $caseFolder[-1]
+
+            # Create Mails subfolder (or get if exists)
+            Write-Log "Creating/getting Mails subfolder"
+            $mailsFolder = New-SharePointFolder -Headers $headers -SiteId $siteId `
+                -DriveId $driveId -ParentPath $caseFolderPath -FolderName "Mails"
+
+            # Create Attachments subfolder (or get if exists)
+            Write-Log "Creating/getting Attachments subfolder"
+            $attachmentsFolder = New-SharePointFolder -Headers $headers -SiteId $siteId `
+                -DriveId $driveId -ParentPath $caseFolderPath -FolderName "Attachments"
+
+
+                
+            # Save metadata
+            $metadataJson = $csvMetadata | ConvertTo-Json -Depth 10
+            $metadataBytes = [System.Text.Encoding]::UTF8.GetBytes($metadataJson)
+            $metadataFileName = "$($caseInfo.CaseId)-metadata.json"
+
+            Write-Log "Uploading $($metadataFileName)"
+            $up = $null
+            $up = Upload-FileToSharePoint -Headers $headers -SiteId $siteId `
+                -DriveId $driveId -FolderPath $caseFolderPath `
+                -FileName $metadataFileName -FileContent $metadataBytes
+
+            if ($null -ne $up){
+                $actionStatus.metadataJSONfound = -not $up
+            }
+
+            #>
+        
+            # Get and save email content as HTML
+            Write-Log "Getting email content as HTML"
+            #$emailData = Get-EmailContentAsHTML -Headers $headers -Mailbox $mailbox -MessageId $message.id
+            $emailData = Get-EmailContentAsHTML2 -Message $message
+            Write-Log "HML data back"
+            #$emailData | out-host
+
+            $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+            #$timeFromMessage = $message.DateTimeReceived.ToString() -Replace ':','-'
+            $timeFromMessage = $message.DateTimeReceived.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ").Replace(':','-')
+
+            $emailFileName = "$($caseInfo.Number)-$($caseInfo.CaseId)-$($caseInfo.Year)_$timeFromMessage.html"
+
+            Write-Log "Uploading email as HTML: $emailFileName"
+            $up = $null
+            $up = Upload-FileToSharePoint -Headers $headers -SiteId $siteId `
+                -DriveId $driveId -FolderPath "$caseFolderPath/Mails" `
+                -FileName $emailFileName -FileContent $emailData
+
+            if ($null -ne $up){
+                $actionStatus.emailBodyFound = -not $up
+            }
+
+            #>
+
+            # Get conversation messages
+            $conversationMessages = Get-ConversationMessages -Service $exchservice -Message $message
+            $conversationId = if ($message.ConversationId) { $message.ConversationId.UniqueId } else { "standalone" }
+        
+            
+            # Process attachments from all messages in conversation to SPO
+            $attachmentCount = 0
+            foreach ($msg in $conversationMessages) {
+                if ($msg.HasAttachments) {
+                    Write-Log "Processing attachments from message: $($msg.Subject)"
+                
+                    foreach ($attachment in $msg.Attachments) {
+                        $result = Export-AttachmentToSPO -Attachment $attachment `
+                                    -ConversationId $conversationId
+                    
+                        if ($result) {
+                            $attachmentCount++
+                        }
+                    }
+                }
+            }
+
+            if ($actionStatus.allAttachmentsCount -lt $attachmentCount){
+                $actionStatus.allAttachmentsCount = $attachmentCount
+            }
+
+        }
+        ###
+        
+        
+        Write-Log "Processing complete. Exported $attachmentCount unique attachments"
+        Write-Log "Output location: $outputPath"
+        Write-Log "========================================"
+        
+        return [ordered]@{
+            Success = $true
+            LocalFSdone = -not $doNotStoreToFileSystem
+            SPOdone = -not $doNotUploadToSPO
+            FSOutputPath = $outputPath
+            AttachmentCount = $attachmentCount
+            ConversationMessageCount = $conversationMessages.Count
+            Error = $null
+        }
+        
+    } catch {
+        Write-Log "Critical error processing message: $_" -Level "ERROR"
+        return [ordered]@{
+            Success = $false
+            LocalFSdone = -not $doNotStoreToFileSystem
+            SPOdone = -not $doNotUploadToSPO
+            FSOutputPath = $outputPath
+            AttachmentCount = $null
+            ConversationMessageCount = $null
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+# Function to load all CSV files by year into a dictionary
+function Load-CSVsByYear {
+    param(
+        [string]$CSVFolderPath,
+        [string[]]$Years = @("2021", "2022", "2023", "2024","2025")
+    )
+
+    $csvDictionary = @{}
+
+    try {
+        Write-Log "Loading CSV files from folder: $CSVFolderPath"
+
+        foreach ($year in $Years) {
+            $csvPath = Join-Path $CSVFolderPath "$year.csv"
+
+            if (Test-Path $csvPath) {
+                Write-Log "Loading CSV for year $year from: $csvPath"
+               $csvDictionary[$year] = Import-Csv -Path $csvPath -Encoding Default -Delimiter ";"
+                #$csvDictionary[$year] =  Import-Csv -Path $csvPath -Encoding ([System.Text.Encoding]::GetEncoding(1250)) -Delimiter ";"
+                Write-Log "Loaded $($csvDictionary[$year].Count) records for year $year"
+            } else {
+                Write-Log "CSV file not found for year $year at: $csvPath" -Level WARNING
+                $csvDictionary[$year] = @()
+            }
+        }
+
+        return $csvDictionary
+    }
+    catch {
+        Write-Log "Error loading CSV files: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+function Parse-EmailSubject {
+    param([string]$Subject)
+
+    # Pattern: number-caseId-year (optionally preceded by RE:, FW:, etc.)
+    if ($Subject -match '(?:RE:|FW:)?\s*(\d+)-(\d+)-(\d{4})') {
+        return @{
+            Number = $matches[1]
+            CaseId = $matches[2]
+            Year = $matches[3]
+            IsValid = $true
+        }
+    }
+
+    return @{
+        IsValid = $false
+    }
+}
+
+function Get-CompanyInfo {
+    <#
+    .SYNOPSIS
+        Extracts company ICO/IC numbers and company names from email subject lines.
+
+    .DESCRIPTION
+        Parses various formats of Czech company identifiers (ICO, IC, IČ) and their associated company names.
+
+    .PARAMETER Subject
+        The email subject line to parse.
+
+    .EXAMPLE
+        Get-CompanyInfo "Re: CUT MYDLAR s.r.o. ič 01399284"
+
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [string]$Subject
+    )
+
+    process {
+        $result = @{
+            ICO = $null
+            CompanyName = $null
+            OriginalSubject = $Subject
+        }
+
+        # Regex pattern to match ICO/IC/IČ/IČO followed by number (with optional colon, space, or dot)
+        # Matches: "ič 01399284", "iČo: 08424322", "IČ 68782004", "ico: 26907445"
+        $icoPattern = '(?:i[cč]o?|IC)[:\s.]+(\d{8})'
+
+        # Clean up the subject first
+        $cleanSubject = $Subject -replace '^(?:Re:|Fwd?:|FW:|Subject:)\s*', ''
+        $cleanSubject = $cleanSubject.Trim()
+
+        if ($Subject -match $icoPattern) {
+            $result.ICO = $Matches[1]
+
+            # Try to extract company name - it's usually before the ICO
+            # Pattern: captures text before the ICO pattern, typically company name with s.r.o., a.s., etc.
+            $namePattern = '(.+?)\s+(?:i[cč]o?|IC)[:\s.]'
+
+            if ($cleanSubject -match $namePattern) {
+                $companyName = $Matches[1].Trim()
+                # Remove trailing commas or dashes
+                $companyName = $companyName -replace '[,\-]+$', ''
+                $result.CompanyName = $companyName.Trim()
+            }
+        }
+        else {
+            # No ICO found, try to extract company name using common patterns
+            # Look for company legal forms: s.r.o., a.s., v.o.s., k.s., družstvo, etc.
+            $companyPattern = '([A-ZÁ-Ž].+?\s+(?:s\.r\.o\.|a\.s\.|v\.o\.s\.|k\.s\.|družstvo|spolek)\.?)(?:\s+\d{8})?'
+
+            if ($cleanSubject -match $companyPattern) {
+                $companyName = $Matches[1].Trim()
+                $result.CompanyName = $companyName
+
+                # Check if there's a standalone 8-digit number that might be ICO
+                if ($cleanSubject -match '\b(\d{8})\b') {
+                    $result.ICO = $Matches[1]
+                }
+            }
+            # Fallback: if there's an 8-digit number, extract it and try to get text before it
+            elseif ($cleanSubject -match '(.+?)\s+(\d{8})') {
+                $result.CompanyName = $Matches[1].Trim()
+                $result.ICO = $Matches[2]
+            }
+        }
+
+        return [PSCustomObject]$result
+    }
+}
+
+function Find-CaseInCSV {
+    param(
+        [hashtable]$CSVDictionary,
+        [string]$Year,
+        [string]$CaseId,
+        [string]$ColumnName = 'Číslo podání'
+    )
+
+    try {
+        Write-Log "Searching for case ID '$CaseId' in year $Year CSV, column '$ColumnName'"
+
+        if (-not $CSVDictionary.ContainsKey($Year)) {
+            Write-Log "Year $Year not found in CSV dictionary" -Level WARNING
+            return $null
+        }
+
+        $csvData = $CSVDictionary["$Year"]
+        $case = $csvData | Where-Object { $_.$ColumnName -eq $CaseId }
+
+        if ($case) {
+            Write-Log "Found case ID '$CaseId' in year $Year CSV"
+
+            # Convert the row to a hashtable with all properties
+            $metadata = @{}
+            $case.PSObject.Properties | ForEach-Object {
+                $metadata[$_.Name] = $_.Value
+            }
+
+            return $metadata
+        } else {
+            Write-Log "Case ID '$CaseId' not found in year $Year CSV" -Level WARNING
+            return $null
+        }
+    }
+    catch {
+        Write-Log "Error searching CSV: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+
+# Function to get access token using AadAuthenticationFactory with certificate
+function Get-GraphAccessToken {
+    param(
+        [string]$ClientId,
+        [string]$TenantId,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [string]$Proxy = $null
+    )
+
+    try {
+        Write-Log "Authenticating to Microsoft Graph API using certificate..."
+
+        # Configure proxy if provided
+        if ($Proxy) {
+            [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($Proxy)
+            [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+            Write-Log "Proxy configured: $Proxy"
+        }
+
+        # Create authentication factory with certificate
+        if ($null -eq $script:graphAuthFact){
+            $script:graphAuthFact = New-AadAuthenticationFactory -DefaultScopes "https://graph.microsoft.com/.default" -name GraphAccess `
+                -ClientId $ClientId `
+                -TenantId $TenantId `
+                -X509Certificate $Certificate
+        }
+
+        # Get token as hashtable for headers
+        $headers = Get-AadToken -Verbose -AsHashTable -Factory $script:graphAuthFact
+
+        Write-Log "Successfully authenticated to Microsoft Graph"
+        return $headers
+    }
+    catch {
+        Write-Log "Failed to authenticate: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+# Function to invoke Graph API
+function Invoke-GraphApi {
+    param(
+        [string]$Uri,
+        [System.Object]$Headers,
+        [string]$Method = "GET",
+        [object]$Body = $null,
+        [string]$ContentType = "application/json"
+    )
+
+    try {
+        $params = @{
+            Uri = $Uri
+            Headers = $Headers
+            Method = $Method
+        }
+
+        if ($Body -and $Method -ne "GET") {
+            if ($ContentType -eq "application/json") {
+                $params.Body = ($Body | ConvertTo-Json -Depth 10)
+            } else {
+                $params.Body = $Body
+            }
+        }
+
+        $response = Invoke-RestMethod @params
+        return $response
+    }
+    catch {
+        Write-Log "Graph API call failed: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+function New-SharePointFolder {
+    param(
+        [hashtable]$Headers,
+        [string]$SiteId,
+        [string]$DriveId,
+        [string]$ParentPath,
+        [string]$FolderName
+    )
+
+    try {
+        # First, try to get the folder if it exists
+        $fullPath = if ($ParentPath) { "$ParentPath/$FolderName" } else { $FolderName }
+        write-log $fullPath
+        #$encodedPath = [System.Web.HttpUtility]::UrlEncode($fullPath)
+        $encodedPath = [System.Web.HttpUtility]::UrlPathEncode($fullPath)
+        
+        write-log $encodedPath
+        $checkUri = "https://graph.microsoft.com/v1.0/sites/$SiteId/drives/$DriveId/root:/$encodedPath"
+        write-log $checkUri
+
+        try {
+            $existingFolder = Invoke-RestMethod -Method GET -Uri $checkUri -Headers $headers
+            Write-Log "Folder '$FolderName' already exists at '$ParentPath'" -Level WARNING
+            #$existingFolder | Format-List | Out-Host
+
+            return $existingFolder, $false
+        }
+        catch {
+            # Folder doesn't exist, create it
+            Write-Log "Folder '$FolderName' does not exist, creating it..."
+        }
+
+        # Creating new folder
+        #$encodedParentPath = [System.Web.HttpUtility]::UrlEncode($ParentPath)
+        $encodedParentPath = [System.Web.HttpUtility]::UrlPathEncode($ParentPath)
+        
+        $uri = "https://graph.microsoft.com/v1.0/sites/$($siteId)/drive/root:/$encodedParentPath`:/children"
+        $body = @{
+            name = $FolderName
+            folder = @{}
+            "@microsoft.graph.conflictBehavior" = "rename"
+        } | ConvertTo-Json
+
+        try {
+            
+            if ($dryRun){
+                Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+                return $FolderName, $true
+            } else {
+                $folder = Invoke-RestMethod -Method POST -Uri $uri -Body $body -ContentType "application/json" -Headers $Headers
+                Write-Log "Successfully created folder '$FolderName'"
+                return $folder, $true
+            }
+        }
+        catch {
+            Write-Log "Couldn't create folder $($FolderName) - $($_.exception.message)" -Level ERROR
+            throw
+        }
+    }
+    catch {
+        Write-Log "Error with folder operation: $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+# Function to upload file to SharePoint
+function Upload-FileToSharePoint {
+    param(
+        [hashtable]$Headers,
+        [string]$SiteId,
+        [string]$DriveId,
+        [string]$FolderPath,
+        [string]$FileName,
+        [byte[]]$FileContent
+    )
+
+    try {
+        #$encodedFolderPath = [System.Web.HttpUtility]::UrlEncode($FolderPath)
+        $encodedFileName = [System.Web.HttpUtility]::UrlEncode($FileName)
+        
+        $encodedFolderPath = [System.Web.HttpUtility]::UrlPathEncode($FolderPath)
+        #$encodedFileName = [System.Web.HttpUtility]::UrlPathEncode($FileName)
+        
+
+        #check if exists
+        $uri = "https://graph.microsoft.com/v1.0/sites/$SiteId/drives/$DriveId/root:/$encodedFolderPath/$encodedFileName"
+
+        # Create a copy of headers and update content type
+        #$uploadHeaders = $Headers.Clone()
+        #$uploadHeaders['Content-Type'] = 'application/octet-stream'
+
+        #$response = Invoke-RestMethod -Uri $uri -Headers $uploadHeaders -Method PUT -Body $FileContent
+        
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Headers $Headers -Method GET
+                    
+            Write-Log "File already exists '$encodedFileName'" -Level WARNING
+            return $false
+
+        }
+        catch {
+            #$_ | write-host    
+            Write-Log "File does not exist '$FileName', going to upload it."
+            
+        }
+        
+
+        #upload
+        
+        $uri = "https://graph.microsoft.com/v1.0/sites/$SiteId/drives/$DriveId/root:/$encodedFolderPath/$encodedFileName`:/content"
+
+        # Create a copy of headers and update content type
+        $uploadHeaders = $Headers.Clone()
+        $uploadHeaders['Content-Type'] = 'application/octet-stream'
+
+        if ($dryRun){
+            Write-Log "!!!!!!! Just simulation, nothing created actually !!!!!!!" -Level TEST
+            return $true
+        } else {
+                
+            $response = Invoke-RestMethod -Uri $uri -Headers $uploadHeaders -Method PUT -Body $FileContent
+            Write-Log "Successfully uploaded file '$FileName'"
+            return $true
+        }
+
+    }
+    catch {
+        Write-Log "Error uploading file '$FileName': $($_.Exception.Message)" -Level ERROR
+        throw
+    }
+}
+
+
+# Main execution
+try {
+    # Ensure base export path exists
+    if (-not (Test-Path $ExportBasePath)) {
+        New-Item -Path $ExportBasePath -ItemType Directory -Force | Out-Null
+    }
+    
+    Write-Log "=== EWS Message Export Script Started ==="
+    
+    # Load all CSV files by year
+    Write-Log "Loading Case reference CSV files from: $CSVFolderPath"
+    $csvDictionary = Load-CSVsByYear -CSVFolderPath $CSVFolderPath
+    Write-Log "CSV files loaded successfully"
+
+    Write-Log "Loading reference of already migrated messages"
+    #message reference from primary mailbox to avoid duplicates
+    $refScan = Import-Csv $refScanPath -Delimiter ';' | select messageID
+
+    Write-Log "Loading input messages reference list"        
+    $msgList = Import-Csv $InputFilePath -Encoding Unicode
+    
+    #
+    $results = New-Object System.Collections.ArrayList
+    
+    #prepare EWS Exchange connection
+    [string]$ClientId = ''
+    [string]$TenantId = ''
+    [string]$CertificateThumbprint = ''
+    [string]$Proxy = ''
+
+    $global:cert = Get-CertificateByThumbprint -Thumbprint $CertificateThumbprint
+
+    [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($Proxy)
+    [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    Write-Log "Proxy configured: $Proxy"
+
+    $script:exchservice = (New-EWSService2 -Mailbox $MailboxName)[-1]
+        
+    #connect SPO for output
+    if ($null -eq $script:spoAuthFact){
+        $script:spoAuthFact = New-AadAuthenticationFactory -DefaultScopes "https://graph.microsoft.com/.default" -name spoAuthFact `
+            -ClientId $ClientId `
+            -TenantId $TenantId `
+            -X509Certificate $Cert
+    }
+
+    $headers = Get-AadToken -Verbose -AsHashTable -Factory $script:spoAuthFact
+    $headersTimeStamp = get-date
+
+    Write-Log "Getting SharePoint site information..."
+    $siteUrl = "https://graph.microsoft.com/v1.0/sites/$SharePointSiteUrl"
+    $site = Invoke-GraphApi -Uri $siteUrl -Headers $headers
+    $siteId = $site.id
+    Write-Log "SharePoint Site ID: $siteId"
+
+    # Get drive information
+    $driveUrl = "https://graph.microsoft.com/v1.0/sites/$siteId/drive"
+    $drive = Invoke-GraphApi -Uri $driveUrl -Headers $headers
+    $driveId = $drive.id
+    Write-Log "SharePoint Drive ID: $driveId"
+    
+       
+    #gathering processing statistics
+    $actionStatuses = New-Object System.Collections.ArrayList
+    $lineCounter = 1
+
+    #do a clean-up
+    try {
+        Get-Item "$ExportBasePath\tempresults.csv" -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+    catch {}
+
+    $list = ($msgList[0..5000])
+    #$list = ($msgList[10960..($msgList.count-1)])
+    
+    #$list = ($msgList | Select-Object -First 2)
+    #$list = $msgList
+    
+    $total = $list.count
+    foreach ($msgRow in $list){
+        
+        write-log ""
+        Write-Log "Processing item $lineCounter of $total" -Level DEBUG
+        write-log ""
+
+        $actionStatus = [pscustomobject][ordered]@{
+               MsgID = $msgRow.messageId
+               SourceMbx = $MailboxName
+               Number = $msgRow.team
+               CaseId = $msgRow.caseId
+               Year = $msgRow.year
+               MappingFound = $false
+               ProcessedFromPrimary = $false
+               SPOCaseFldFound = $false
+               metadataJSONfound = $false
+               emailBodyFound = $false
+               allAttachmentsCount = 0
+               numAttachmentsFound = 0
+               attachmentsFoundNames = @()
+         }
+        
+        
+        
+        $caseInfo = [pscustomobject]@{
+               Number = $msgRow.team
+               CaseId = $msgRow.caseId
+               Year = $msgRow.year
+         }
+
+        Write-Log "Extracted case info - Number: $($caseInfo.Number), CaseId: $($caseInfo.CaseId), Year: $($caseInfo.Year)"
+        
+        $csvMetadata = Find-CaseInCSV -CSVDictionary $csvDictionary `
+                        -Year $caseInfo.Year -CaseId $caseInfo.CaseId -ColumnName $CSVCaseIdColumn
+
+        if (-not $csvMetadata) {
+            Write-Log "Case not found in CSV for year $($caseInfo.Year), skipping..." -Level WARNING
+            continue
+        }
+        $actionStatus.MappingFound = $true
+        
+        #check in not already processed from primary mailbox
+        $exists = $null
+        $exists = $refScan | Where-Object {$_.messageID -ceq $id}
+        if ($exists){
+            write-log "Duplicate: $id" -Level WARNING
+            $actionStatus.ProcessedFromPrimary = $true
+            continue
+        } else {
+            Write-Log "Unique"
+        }
+        
+        
+        #refresh the EWS connection if needed
+        if ($script:headersEWS.ExpiresOn - (get-date) -lt [timespan]::FromMinutes(5) ){
+            Write-Log "Token for EWS dies soon, refreshing the factory..." -Level WARNING 
+            $script:exchservice = (New-EWSService2 -Mailbox $MailboxName)[-1]
+        }
+
+        #refresh the SPO token if needed
+        if ( ((get-date) - $headersTimeStamp) -gt [timespan]::FromHours(1) ){
+            Write-Log "Token for SPO dies soon, refreshing the factory..." -Level WARNING 
+            $headers = Get-AadToken -Verbose -AsHashTable -Factory $script:spoAuthFact
+        }
+        
+        #for fast testing        
+        if ($testConn){
+            
+            $result = (@(Process-Message_t -MsgId $msgRow.messageId -Mailbox $MailboxName -exchService $exchservice))[-1]
+            $result
+            $lineCounter++
+            continue
+
+        } else {
+            
+            #calling the main message handling -- export to storage and SPO
+            $result = (@(Process-Message -MsgId $msgRow.messageId -Mailbox $MailboxName -exchService $exchservice))[-1]
+
+        }
+        
+        
+        
+        $objResult = New-Object psobject -Property $result
+        #$objResult | Format-List | Out-Host
+        $results.Add($objResult)
+
+        #Write-Log "$ExportBasePath\tempresults.csv"
+        #if ($lineCounter % 50 -eq 0){
+        #    $results | Export-Csv "$ExportBasePath\tempresults.csv" -Force -NoTypeInformation
+        #}
+
+        #store status
+        [void]$actionStatuses.Add($actionStatus)
+                
+        if ($result.Success) {
+            Write-Host "`nExport completed successfully!" -ForegroundColor Green
+            
+            foreach ($key in $result.keys){
+                Write-Host "$key : $($result.$key)"
+            }
+            
+            #Write-Host "Output Path: $($result.OutputPath)"
+            #Write-Host "Attachments Exported: $($result.AttachmentCount)"
+            #Write-Host "Conversation Messages: $($result.ConversationMessageCount)"
+
+
+        } else {
+            Write-Host "`nExport failed: $($result.Error)" -ForegroundColor Red
+            #exit 1
+        }
+
+        #Write-Log "$ExportBasePath\tempresults.csv"
+        if ($lineCounter % 50 -eq 0){
+            $results | Export-Csv "$ExportBasePath\tempresults.csv" -Force -NoTypeInformation -Encoding Unicode
+            $actionStatuses | Export-Clixml "$ExportBasePath\tempactionStatuses.xml" -Depth 3 -Force -Encoding Unicode
+            [gc]::Collect()
+
+        }
+                
+        $lineCounter++
+    }
+    
+} catch {
+    Write-Log "Script execution failed: $_" -Level "ERROR"
+    Write-Host "`nScript execution failed: $_" -ForegroundColor Red
+    exit 1
+}
+
+$results | Export-Csv "$ExportBasePath/results.csv" -NoTypeInformation  -Encoding Unicode
+$actionStatuses | ConvertTo-Json -Depth 3 | Set-Content "$ExportBasePath\actionStatuses.json"  -Encoding Unicode
+$actionStatuses | Export-Clixml "$ExportBasePath\actionStatuses.xml" -Depth 3  -Encoding Unicode
+$actionStatuses | Export-Csv "$ExportBasePath\actionStatuses.csv" -NoTypeInformation  -Encoding Unicode
 
